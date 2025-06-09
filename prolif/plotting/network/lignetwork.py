@@ -18,10 +18,11 @@ import operator
 import re
 import warnings
 from collections import defaultdict
+from collections.abc import Iterable
 from copy import deepcopy
 from html import escape
 from pathlib import Path
-from typing import ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TextIO, Union, cast
 from uuid import uuid4
 
 import numpy as np
@@ -30,7 +31,8 @@ from rdkit import Chem
 from rdkit.Chem import rdDepictor
 
 from prolif.exceptions import RunRequiredError
-from prolif.plotting.utils import grouped_interaction_colors
+from prolif.ifp import IFP
+from prolif.plotting.utils import grouped_interaction_colors, metadata_iterator
 from prolif.residue import ResidueId
 from prolif.utils import requires
 
@@ -43,6 +45,12 @@ else:
         "ignore",
         "Consider using IPython.display.IFrame instead",  # pragma: no cover
     )
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
+
+    from prolif.fingerprint import Fingerprint
+    from prolif.ifp import IFP
 
 
 class LigNetwork:
@@ -66,7 +74,7 @@ class LigNetwork:
     molsize : int
         Multiply the coordinates by this number to create a bigger and
         more readable depiction
-    rotation : int
+    rotation : float
         Rotate the structure on the XY plane
     carbon : float
         Size of the carbon atom dots on the depiction. Use `0` to hide the
@@ -125,6 +133,7 @@ class LigNetwork:
             "Basic": "#5979e3",
             "Polar": "#59bee3",
             "Sulfur": "#e3ce59",
+            "Water": "#323aa8",
         },
     }
     RESIDUE_TYPES: ClassVar = {
@@ -156,6 +165,23 @@ class LigNetwork:
         "CYM": "Sulfur",
         "CYX": "Sulfur",
         "MET": "Sulfur",
+        "WAT": "Water",
+        "SOL": "Water",
+        "H2O": "Water",
+        "HOH": "Water",
+        "OH2": "Water",
+        "HHO": "Water",
+        "OHH": "Water",
+        "TIP": "Water",
+        "T3P": "Water",
+        "T4P": "Water",
+        "T5P": "Water",
+        "TIP2": "Water",
+        "TIP3": "Water",
+        "TIP4": "Water",
+    }
+    _FONTCOLORS: ClassVar = {
+        "Water": "white",
     }
     _LIG_PI_INTERACTIONS: ClassVar = [
         "EdgeToFace",
@@ -163,71 +189,33 @@ class LigNetwork:
         "PiStacking",
         "PiCation",
     ]
+    _BRIDGED_INTERACTIONS: ClassVar[dict[str, str]] = {"WaterBridge": "water_residues"}
     _DISPLAYED_ATOM: ClassVar = {  # index 0 in indices tuple by default
         "HBDonor": 1,
         "XBDonor": 1,
     }
-    _JS_TEMPLATE = """
-        var ifp, legend, nodes, edges, legend_buttons;
-        function drawGraph(_id, nodes, edges, options) {
-            var container = document.getElementById(_id);
-            nodes = new vis.DataSet(nodes);
-            edges = new vis.DataSet(edges);
-            var data = {nodes: nodes, edges: edges};
-            var network = new vis.Network(container, data, options);
-            network.on("stabilizationIterationsDone", function () {
-                network.setOptions( { physics: false } );
-            });
-            return network;
-        }
-        nodes = %(nodes)s;
-        edges = %(edges)s;
-        ifp = drawGraph('%(div_id)s', nodes, edges, %(options)s);
-    """
-    _HTML_TEMPLATE = """
-        <html>
-        <head>
-        <script type="text/javascript" src="https://unpkg.com/vis-network@9.0.4/dist/vis-network.min.js"></script>
-        <link href="https://unpkg.com/vis-network@9.0.4/dist/dist/vis-network.min.css" rel="stylesheet" type="text/css" />
-        <style type="text/css">
-            body {
-                padding: 0;
-                margin: 0;
-                background: #fff;
-            }
-            .legend-btn.residues.disabled {
-                background: #b4b4b4 !important;
-                color: #555 !important;
-            }
-            .legend-btn.interactions.disabled {
-                border-color: #b4b4b4 !important;
-                color: #555 !important;
-            }
-        </style>
-        </head>
-        <body>
-        <div id="mynetwork"></div>
-        <div id="networklegend"></div>
-        <script type="text/javascript">
-            %(js)s
-        </script>
-        </body>
-        </html>
-    """  # noqa: E501
+
+    _JS_FILE = Path(__file__).parent / "network.js"
+    _HTML_FILE = Path(__file__).parent / "network.html"
+    _CSS_FILE = Path(__file__).parent / "network.css"
+
+    _HTML_TEMPLATE = _HTML_FILE.read_text()
+    _JS_TEMPLATE = _JS_FILE.read_text()
+    _CSS_TEMPLATE = _CSS_FILE.read_text()
 
     def __init__(
         self,
-        df,
-        lig_mol,
-        use_coordinates=False,
-        flatten_coordinates=True,
-        kekulize=False,
-        molsize=35,
-        rotation=0,
-        carbon=0.16,
-    ):
+        df: pd.DataFrame,
+        lig_mol: Chem.Mol,
+        use_coordinates: bool = False,
+        flatten_coordinates: bool = True,
+        kekulize: bool = False,
+        molsize: int = 35,
+        rotation: float = 0,
+        carbon: float = 0.16,
+    ) -> None:
         self.df = df
-        self._interacting_atoms = {
+        self._interacting_atoms: set[int] = {
             atom for atoms in df.index.get_level_values("atoms") for atom in atoms
         }
         mol = deepcopy(lig_mol)
@@ -238,7 +226,7 @@ class LigNetwork:
                 rdDepictor.GenerateDepictionMatching3DStructure(mol, lig_mol)
         else:
             rdDepictor.Compute2DCoords(mol, clearConfs=True)
-        xyz = mol.GetConformer().GetPositions()
+        xyz: "NDArray[np.float64]" = mol.GetConformer().GetPositions()
         if rotation:
             theta = np.radians(rotation)
             c, s = np.cos(theta), np.sin(theta)
@@ -248,7 +236,7 @@ class LigNetwork:
             xy = ((xy - center) @ R.T) + center
             xyz = np.concatenate([xy, z], axis=1)
         if carbon:
-            self._carbon = {
+            self._carbon: dict[str, Any] = {
                 "label": " ",
                 "shape": "dot",
                 "color": self.COLORS["atoms"]["C"],
@@ -259,7 +247,7 @@ class LigNetwork:
         self.xyz = molsize * xyz
         self.mol = mol
         self._multiplier = molsize
-        self.options = {}
+        self.options: dict[str, Any] = {}
         self._max_interaction_width = 6
         self._avoidOverlap = 0.8
         self._springConstant = 0.1
@@ -287,19 +275,19 @@ class LigNetwork:
         }
         # ID for saving to PNG with JS
         self.uuid = uuid4().hex
-        self._iframe = None
+        self._iframe: str | None = None
 
     @classmethod
     def from_fingerprint(
         cls,
-        fp,
-        ligand_mol,
-        kind="aggregate",
-        frame=0,
-        display_all=False,
-        threshold=0.3,
-        **kwargs,
-    ):
+        fp: "Fingerprint",
+        ligand_mol: Chem.Mol,
+        kind: Literal["aggregate", "frame"] = "aggregate",
+        frame: int = 0,
+        display_all: bool = False,
+        threshold: float = 0.3,
+        **kwargs: Any,
+    ) -> "LigNetwork":
         """Helper method to create a ligand interaction diagram from a
         :class:`~prolif.fingerprint.Fingerprint` object.
 
@@ -350,38 +338,55 @@ class LigNetwork:
             return cls(df, ligand_mol, **kwargs)
         raise ValueError(f'{kind!r} must be "aggregate" or "frame"')
 
-    @staticmethod
-    def _get_records(ifp, all_metadata):
+    @classmethod
+    def _get_records(cls, ifp: "IFP", all_metadata: bool) -> list[dict[str, Any]]:
         records = []
         for (lig_resid, prot_resid), int_data in ifp.items():
             for int_name, metadata_tuple in int_data.items():
-                entry = {
-                    "ligand": str(lig_resid),
-                    "protein": str(prot_resid),
-                    "interaction": int_name,
-                }
-                if all_metadata:
-                    for metadata in metadata_tuple:
+                is_bridged_interaction = cls._BRIDGED_INTERACTIONS.get(int_name, None)
+                for metadata in metadata_iterator(metadata_tuple, all_metadata):
+                    if is_bridged_interaction:
+                        distances = [d for d in metadata if d.startswith("distance_")]
+                        for distlabel in distances:
+                            _, src, dest = distlabel.split("_")
+                            if src == "ligand":
+                                components = "ligand_water"
+                                src = str(lig_resid)
+                                atoms = metadata["parent_indices"]["ligand"]
+                            elif dest == "protein":
+                                components = "water_protein"
+                                dest = str(prot_resid)
+                                atoms = ()
+                            else:
+                                components = "water_water"
+                                atoms = ()
+                            records.append(
+                                {
+                                    "ligand": src,
+                                    "protein": dest,
+                                    "interaction": int_name,
+                                    "components": components,
+                                    "atoms": atoms,
+                                    "distance": metadata[distlabel],
+                                }
+                            )
+                    else:
                         records.append(
                             {
-                                **entry,
+                                "ligand": str(lig_resid),
+                                "protein": str(prot_resid),
+                                "interaction": int_name,
+                                "components": "ligand_protein",
                                 "atoms": metadata["parent_indices"]["ligand"],
                                 "distance": metadata.get("distance", 0),
-                            },
+                            }
                         )
-                else:
-                    # extract interaction with shortest distance
-                    metadata = min(
-                        metadata_tuple,
-                        key=lambda m: m.get("distance", np.nan),
-                    )
-                    entry["atoms"] = metadata["parent_indices"]["ligand"]
-                    entry["distance"] = metadata.get("distance", 0)
-                    records.append(entry)
         return records
 
     @classmethod
-    def _make_agg_df_from_fp(cls, fp, threshold=0.3):
+    def _make_agg_df_from_fp(
+        cls, fp: "Fingerprint", threshold: float = 0.3
+    ) -> pd.DataFrame:
         data = []
         for ifp in fp.ifp.values():
             data.extend(cls._get_records(ifp, all_metadata=False))
@@ -391,6 +396,7 @@ class LigNetwork:
         df = df.groupby(["ligand", "protein", "interaction", "atoms"]).agg(
             weight=("weight", "sum"),
             distance=("distance", "mean"),
+            components=("components", "first"),
         )
         df["weight"] /= len(fp.ifp)
         # merge different ligand atoms of the same residue/interaction group before
@@ -402,7 +408,7 @@ class LigNetwork:
         )
         # threshold and keep most occuring ligand atom
         return (
-            df.loc[df["weight_total"] >= threshold]
+            df[df["weight_total"] >= threshold]
             .drop(columns="weight_total")
             .sort_values("weight", ascending=False)
             .groupby(level=["ligand", "protein", "interaction"])
@@ -411,19 +417,21 @@ class LigNetwork:
         )
 
     @classmethod
-    def _make_frame_df_from_fp(cls, fp, frame=0, display_all=False):
+    def _make_frame_df_from_fp(
+        cls, fp: "Fingerprint", frame: int = 0, display_all: bool = False
+    ) -> pd.DataFrame:
         ifp = fp.ifp[frame]
         data = cls._get_records(ifp, all_metadata=display_all)
         df = pd.DataFrame(data)
         df["weight"] = 1
         return df.set_index(["ligand", "protein", "interaction", "atoms"]).reindex(
-            columns=["weight", "distance"],
+            columns=["weight", "distance", "components"],
         )
 
-    def _make_carbon(self):
+    def _make_carbon(self) -> dict[str, Any]:
         return deepcopy(self._carbon)
 
-    def _make_lig_node(self, atom):
+    def _make_lig_node(self, atom: Chem.Atom) -> None:
         """Prepare ligand atoms"""
         idx = atom.GetIdx()
         elem = atom.GetSymbol()
@@ -432,11 +440,11 @@ class LigNetwork:
             return
         charge = atom.GetFormalCharge()
         if charge != 0:
-            charge = "{}{}".format(
+            displayed_charge = "{}{}".format(
                 "" if abs(charge) == 1 else str(charge),
                 "+" if charge > 0 else "-",
             )
-            label = f"{elem}{charge}"
+            label = f"{elem}{displayed_charge}"
             shape = "ellipse"
         else:
             label = elem
@@ -462,9 +470,9 @@ class LigNetwork:
                 "borderWidth": 0,
             },
         )
-        self.nodes[idx] = node
+        self._nodes[idx] = node
 
-    def _make_lig_edge(self, bond):
+    def _make_lig_edge(self, bond: Chem.Bond) -> None:
         """Prepare ligand bonds"""
         idx = [bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()]
         if any(i in self.exclude for i in idx):
@@ -484,7 +492,7 @@ class LigNetwork:
         else:
             self._make_non_single_bond(idx, btype)
 
-    def _make_non_single_bond(self, ids, btype):
+    def _make_non_single_bond(self, ids: list[int], btype: float) -> None:
         """Prepare double, triple and aromatic bonds"""
         xyz = self.xyz[ids]
         d = xyz[1, :2] - xyz[0, :2]
@@ -499,7 +507,7 @@ class LigNetwork:
                 xy = point[:2] + perp * dist
                 id_ = hash(xy.tobytes())
                 nodes.append(id_)
-                self.nodes[id_] = {
+                self._nodes[id_] = {
                     "id": id_,
                     "x": xy[0],
                     "y": xy[1],
@@ -543,10 +551,16 @@ class LigNetwork:
                 },
             )
 
-    def _make_interactions(self, mass=2):
+    def _make_interactions(self, mass: int = 2) -> None:
         """Prepare lig-prot interactions"""
-        restypes = {}
-        for prot_res in self.df.index.get_level_values("protein").unique():
+        restypes: dict[str, str | None] = {}
+        lig_prot_df = self.df[self.df["components"] == "ligand_protein"]
+        prot_and_waters: set[str] = (
+            set(self.df.index.get_level_values("protein"))
+            .union(self.df.index.get_level_values("ligand"))
+            .difference(lig_prot_df.index.get_level_values("ligand"))
+        )
+        for prot_res in prot_and_waters:
             resname = ResidueId.from_string(prot_res).name
             restype = self.RESIDUE_TYPES.get(resname)
             restypes[prot_res] = restype
@@ -555,6 +569,7 @@ class LigNetwork:
                 "id": prot_res,
                 "label": prot_res,
                 "color": color,
+                "font": {"color": self._FONTCOLORS.get(restype, "black")},
                 "shape": "box",
                 "borderWidth": 0,
                 "physics": True,
@@ -562,27 +577,37 @@ class LigNetwork:
                 "group": "protein",
                 "residue_type": restype,
             }
-            self.nodes[prot_res] = node
+            self._nodes[prot_res] = node
         for (lig_res, prot_res, interaction, lig_indices), (
             weight,
             distance,
-        ) in self.df.iterrows():
-            if interaction in self._LIG_PI_INTERACTIONS:
-                centroid = self._get_ring_centroid(lig_indices)
-                origin = f"centroid({lig_res}, {prot_res}, {interaction})"
-                self.nodes[origin] = {
-                    "id": origin,
-                    "x": centroid[0],
-                    "y": centroid[1],
-                    "shape": "text",
-                    "label": " ",
-                    "fixed": True,
-                    "physics": False,
-                    "group": "ligand",
-                }
+            components,
+        ) in cast(
+            Iterable[
+                tuple[tuple[str, str, str, tuple[int, ...]], tuple[float, float, str]]
+            ],
+            self.df.iterrows(),
+        ):
+            if components.startswith("ligand"):
+                if interaction in self._LIG_PI_INTERACTIONS:
+                    centroid = self._get_ring_centroid(lig_indices)
+                    origin = f"centroid({lig_res}, {prot_res}, {interaction})"
+                    self._nodes[origin] = {
+                        "id": origin,
+                        "x": centroid[0],
+                        "y": centroid[1],
+                        "shape": "text",
+                        "label": " ",
+                        "fixed": True,
+                        "physics": False,
+                        "group": "ligand",
+                    }
+                else:
+                    i = self._DISPLAYED_ATOM.get(interaction, 0)
+                    origin = lig_indices[i]
             else:
-                i = self._DISPLAYED_ATOM.get(interaction, 0)
-                origin = lig_indices[i]
+                # water-water or water-protein
+                origin = lig_res
             int_data = {
                 "interaction": interaction,
                 "distance": distance,
@@ -605,41 +630,42 @@ class LigNetwork:
                 "dashes": [10],
                 "width": weight * self._max_interaction_width,
                 "group": "interaction",
+                "components": components,
             }
             if self.show_interaction_data:
                 edge["label"] = self._edge_label_formatter.format_map(int_data)
                 edge["font"] = self._edge_label_font
             self.edges.append(edge)
 
-    def _get_ring_centroid(self, indices):
+    def _get_ring_centroid(self, indices: tuple[int, ...]) -> "NDArray[np.float64]":
         """Find ring centroid coordinates using the indices of the ring atoms"""
-        return self.xyz[list(indices)].mean(axis=0)
+        return self.xyz[list(indices)].mean(axis=0)  # type: ignore[no-any-return]
 
-    def _patch_hydrogens(self):
+    def _patch_hydrogens(self) -> None:
         """Patch hydrogens on heteroatoms
 
         Hydrogen atoms that aren't part of any interaction have been hidden at
         this stage, but they should be added to the label of the heteroatom for
         clarity
         """
-        to_patch = defaultdict(int)
+        to_patch: defaultdict[int, int] = defaultdict(int)
         for idx in self.exclude:
             h = self.mol.GetAtomWithIdx(idx)
-            atom = h.GetNeighbors()[0]
+            atom: Chem.Atom = h.GetNeighbors()[0]
             if atom.GetSymbol() != "C":
                 to_patch[atom.GetIdx()] += 1
         for idx, nH in to_patch.items():
-            node = self.nodes[idx]
+            node = self._nodes[idx]
             h_str = "H" if nH == 1 else f"H{nH}"
             label = re.sub(r"(\w+)(.*)", rf"\1{h_str}\2", node["label"])
             node["label"] = label
             node["shape"] = "ellipse"
 
-    def _make_graph_data(self):
+    def _make_graph_data(self) -> None:
         """Prepares the nodes and edges"""
-        self.exclude = []
-        self.nodes = {}
-        self.edges = []
+        self.exclude: list[int] = []
+        self._nodes: dict[int | str, dict[str, Any]] = {}
+        self.edges: list[dict[str, Any]] = []
         # show residues
         self._make_interactions()
         # show ligand
@@ -648,16 +674,16 @@ class LigNetwork:
         for bond in self.mol.GetBonds():
             self._make_lig_edge(bond)
         self._patch_hydrogens()
-        self.nodes = list(self.nodes.values())
+        self.nodes = list(self._nodes.values())
 
     def _get_js(
         self,
-        width="100%",
-        height="500px",
-        div_id="mynetwork",
-        fontsize=20,
-        show_interaction_data=False,
-    ):
+        width: str = "100%",
+        height: str = "500px",
+        div_id: str = "mynetwork",
+        fontsize: int = 20,
+        show_interaction_data: bool = False,
+    ) -> dict[str, Any]:
         """Returns the JavaScript code to draw the network"""
         self.width = width
         self.height = height
@@ -678,20 +704,27 @@ class LigNetwork:
             },
         }
         options.update(self.options)
-        js = self._JS_TEMPLATE % {
+
+        # get the legend buttons
+        buttons = self._get_legend_buttons()
+
+        return {
             "div_id": div_id,
             "nodes": json.dumps(self.nodes),
             "edges": json.dumps(self.edges),
             "options": json.dumps(options),
+            "js_file_content": self._JS_TEMPLATE,
+            "css_file_content": self._CSS_TEMPLATE,
+            "buttons": json.dumps(buttons),
         }
-        js += self._get_legend()
-        return js
 
-    def _get_html(self, **kwargs):
+    def _get_html(self, **kwargs: Any) -> str:
         """Returns the HTML code to draw the network"""
-        return self._HTML_TEMPLATE % {"js": self._get_js(**kwargs)}
+        js_data = self._get_js(**kwargs)
+        return self._HTML_TEMPLATE % js_data
 
-    def _get_legend(self, height="90px"):
+    def _get_legend_buttons(self, height: str = "90px") -> list[dict[str, Any]]:
+        """Prepare the legend buttons data"""
         available = {}
         buttons = []
         map_color_restype = {c: t for t, c in self.COLORS["residues"].items()}
@@ -707,7 +740,13 @@ class LigNetwork:
         available = dict(sorted(available.items(), key=operator.itemgetter(1)))
         for i, (color, restype) in enumerate(available.items()):
             buttons.append(
-                {"index": i, "label": restype, "color": color, "group": "residues"},
+                {
+                    "index": i,
+                    "label": restype,
+                    "color": color,
+                    "fontcolor": self._FONTCOLORS.get(restype, "black"),
+                    "group": "residues",
+                },
             )
         # interactions
         available.clear()
@@ -722,124 +761,21 @@ class LigNetwork:
                     "index": i,
                     "label": interaction,
                     "color": color,
+                    "fontcolor": "black",
                     "group": "interactions",
                 },
             )
-        # JS code
+
+        # update height for legend
         if all("px" in h for h in [self.height, height]):
             h1 = int(re.findall(r"(\d+)\w+", self.height)[0])
             h2 = int(re.findall(r"(\d+)\w+", height)[0])
             self.height = f"{h1 + h2}px"
-        return (
-            """
-            legend_buttons = %(buttons)s;
-            legend = document.getElementById('%(div_id)s');
-            var div_residues = document.createElement('div');
-            var div_interactions = document.createElement('div');
-            var disabled = [];
-            var legend_callback = function() {
-                this.classList.toggle("disabled");
-                var hide = this.classList.contains("disabled");
-                var show = !hide;
-                var btn_label = this.innerHTML;
-                if (hide) {
-                    disabled.push(btn_label);
-                } else {
-                    disabled = disabled.filter(x => x !== btn_label);
-                }
-                var node_update = [],
-                    edge_update = [];
-                // click on residue type
-                if (this.classList.contains("residues")) {
-                    nodes.forEach((node) => {
-                        // find nodes corresponding to this type
-                        if (node.residue_type === btn_label) {
-                            // if hiding this type and residue isn't already hidden
-                            if (hide && !node.hidden) {
-                                node.hidden = true;
-                                node_update.push(node);
-                            // if showing this type and residue isn't already visible
-                            } else if (show && node.hidden) {
-                                // display if there's at least one of its edge that isn't hidden
-                                num_edges_active = edges.filter(x => x.to === node.id)
-                                                        .map(x => Boolean(x.hidden))
-                                                        .filter(x => !x)
-                                                        .length;
-                                if (num_edges_active > 0) {
-                                    node.hidden = false;
-                                    node_update.push(node);
-                                }
-                            }
-                        }
-                    });
-                    ifp.body.data.nodes.update(node_update);
-                // click on interaction type
-                } else {
-                    edges.forEach((edge) => {
-                        // find edges corresponding to this type
-                        if (edge.interaction_type === btn_label) {
-                            edge.hidden = !edge.hidden;
-                            edge_update.push(edge);
-                            // number of active edges for the corresponding residue
-                            var num_edges_active = edges.filter(x => x.to === edge.to)
-                                                .map(x => Boolean(x.hidden))
-                                                .filter(x => !x)
-                                                .length;
-                            // find corresponding residue
-                            var ix = nodes.findIndex(x => x.id === edge.to);
-                            // only change visibility if residue_type not being hidden
-                            if (!(disabled.includes(nodes[ix].residue_type))) {
-                                // hide if no edge being shown for this residue
-                                if (hide && (num_edges_active === 0)) {
-                                    nodes[ix].hidden = true;
-                                    node_update.push(nodes[ix]);
-                                // show if edges are being shown
-                                } else if (show && (num_edges_active > 0)) {
-                                    nodes[ix].hidden = false;
-                                    node_update.push(nodes[ix]);
-                                }
-                            }
-                        }
-                    });
-                    ifp.body.data.nodes.update(node_update);
-                    ifp.body.data.edges.update(edge_update);
-                }
-            };
-            legend_buttons.forEach(function(v,i) {
-                if (v.group === "residues") {
-                    var div = div_residues;
-                    var border = "none";
-                    var color = v.color;
-                } else {
-                    var div = div_interactions;
-                    var border = "3px dashed " + v.color;
-                    var color = "white";
-                }
-                var button = div.appendChild(document.createElement('button'));
-                button.classList.add("legend-btn", v.group);
-                button.innerHTML = v.label;
-                Object.assign(button.style, {
-                    "cursor": "pointer",
-                    "background-color": color,
-                    "border": border,
-                    "border-radius": "5px",
-                    "padding": "5px",
-                    "margin": "5px",
-                    "font": "14px 'Arial', sans-serif",
-                });
-                button.onclick = legend_callback;
-            });
-            legend.appendChild(div_residues);
-            legend.appendChild(div_interactions);
-            """  # noqa: E501, UP031
-            % {
-                "div_id": "networklegend",
-                "buttons": json.dumps(buttons),
-            }
-        )
+
+        return buttons
 
     @requires("IPython.display")
-    def display(self, **kwargs):
+    def display(self, **kwargs: Any) -> "LigNetwork":
         """Prepare and display the network.
 
         Parameters
@@ -847,7 +783,7 @@ class LigNetwork:
         width: str = "100%"
         height: str = "500px"
         fontsize: int = 20
-        show_occurence: bool = False
+        show_interaction_data: bool = False
         """
         html = self._get_html(**kwargs)
         doc = escape(html)
@@ -858,7 +794,7 @@ class LigNetwork:
         return self
 
     @requires("IPython.display")
-    def show(self, filename, **kwargs):
+    def show(self, filename: str, **kwargs: Any) -> "LigNetwork":
         """Save the network as HTML and display the resulting file"""
         html = self._get_html(**kwargs)
         with open(filename, "w") as f:
@@ -869,7 +805,7 @@ class LigNetwork:
         )
         return self
 
-    def save(self, fp, **kwargs):
+    def save(self, fp: Union[str, Path, "TextIO"], **kwargs: Any) -> None:
         """Save the network to an HTML file
 
         Parameters
@@ -885,7 +821,7 @@ class LigNetwork:
             fp.write(html)
 
     @requires("IPython.display")
-    def save_png(self):
+    def save_png(self) -> Any:
         """Saves the current state of the ligplot to a PNG. Not available outside of a
         notebook.
 
@@ -907,7 +843,7 @@ class LigNetwork:
             """),
         )
 
-    def _repr_html_(self):  # noqa: PLW3201, RUF100
+    def _repr_html_(self) -> str | None:
         if self._iframe:
             return self._iframe
         return None

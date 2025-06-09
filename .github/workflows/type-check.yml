@@ -1,0 +1,93 @@
+name: "Type-check"
+
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+
+jobs:
+  typing:
+    name: Type checking
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install project and dependencies
+        run: |
+          uv sync --group type-check --locked
+
+      - name: Setup
+        run: |
+          mkdir -p tmp_data
+          sudo apt install -y colorized-logs
+
+      - name: Run typing tree on target branch
+        run: |
+          uv run python scripts/check_types.py | tee tmp_data/target.txt
+
+      - name: Checkout PR branch
+        run: |
+          git fetch https://github.com/${{ github.event.pull_request.head.repo.owner.login }}/${{ github.event.pull_request.head.repo.name }}.git ${{ github.event.pull_request.head.ref }}:diff-head
+          git checkout diff-head
+
+      - name: Run typing tree on PR branch
+        run: |
+          uv run python scripts/check_types.py | tee tmp_data/branch.txt
+
+      - name: Run type checking on PR branch
+        run: |
+          uv run poe type-check | tee tmp_data/log.txt
+
+      - name: Generate diff
+        run: |
+          diff --suppress-common-lines tmp_data/target.txt tmp_data/branch.txt  | tee tmp_data/diff.txt
+
+      - name: Create comment content
+        run: |
+          {
+            echo '### Type-checking report'
+            echo '```'
+            cat tmp_data/diff.txt | ansi2txt
+            echo '```'
+            echo '<details>'
+            echo '<summary>Overview</summary>'
+            echo ''
+            echo '```'
+            cat tmp_data/branch.txt
+            echo '```'
+            echo '</details>'
+            echo '<details>'
+            echo '<summary>Remaining errors</summary>'
+            echo ''
+            echo '```'
+            cat tmp_data/log.txt | ansi2txt
+            echo '```'
+            echo '</details>'
+          } >> tmp_data/comment.md
+
+      - name: Find Comment
+        uses: peter-evans/find-comment@v3
+        id: fc-typecheck
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: "github-actions[bot]"
+          body-includes: "### Type-checking report"
+
+      - name: Create or update comment
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.fc-typecheck.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: "tmp_data/comment.md"
+          edit-mode: replace
